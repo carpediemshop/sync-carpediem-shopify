@@ -35,7 +35,7 @@ if (!SHOPIFY_APP_URL || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
   );
 }
 
-// Scopes (coerenti con Render ENV SHOPIFY_SCOPES se lo usi)
+// Scopes
 const SCOPES = ["read_products", "write_inventory", "read_orders"].join(",");
 
 // ---------- helpers ----------
@@ -60,7 +60,9 @@ function verifyOAuthHmac(query, secret) {
 
   const message = Object.keys(rest)
     .sort()
-    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
+    .map(
+      (key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`
+    )
     .join("&");
 
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
@@ -94,7 +96,6 @@ function delState(state) {
 // CSP per embedded app in Shopify Admin
 function setShopifyCsp(req, res) {
   const shop = req.query.shop;
-  // admin.shopify.com (nuovo admin) + dominio shop
   if (isValidShop(shop)) {
     res.setHeader(
       "Content-Security-Policy",
@@ -103,7 +104,6 @@ function setShopifyCsp(req, res) {
   } else {
     res.setHeader("Content-Security-Policy", `frame-ancestors https://admin.shopify.com;`);
   }
-  // Non bloccare iframe
   res.setHeader("X-Frame-Options", "ALLOWALL");
 }
 
@@ -116,9 +116,7 @@ app.post(
   bodyParser.raw({ type: "application/json" }),
   (req, res) => {
     try {
-      if (!SHOPIFY_WEBHOOK_SECRET) {
-        return res.status(200).send("ok");
-      }
+      if (!SHOPIFY_WEBHOOK_SECRET) return res.status(200).send("ok");
 
       const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
       const body = req.body; // Buffer
@@ -143,10 +141,8 @@ app.post(
 app.get("/auth", (req, res) => {
   try {
     const shop = req.query.shop;
-    const host = req.query.host; // a volte Shopify lo passa (embedded)
-    if (!isValidShop(shop)) {
-      return res.status(400).send("Invalid or missing shop parameter");
-    }
+    const host = req.query.host;
+    if (!isValidShop(shop)) return res.status(400).send("Invalid or missing shop parameter");
 
     const state = randomState();
     putState(state, { shop, host: host || "" });
@@ -176,9 +172,7 @@ app.get("/auth/callback", async (req, res) => {
     if (!code || !state) return res.status(400).send("Missing code/state");
 
     const st = getState(state);
-    if (!st || st.shop !== shop) {
-      return res.status(400).send("Invalid/expired state");
-    }
+    if (!st || st.shop !== shop) return res.status(400).send("Invalid/expired state");
 
     const okHmac = verifyOAuthHmac(req.query, SHOPIFY_CLIENT_SECRET);
     if (!okHmac) return res.status(400).send("HMAC validation failed");
@@ -206,7 +200,7 @@ app.get("/auth/callback", async (req, res) => {
     await upsertShopToken(shop, accessToken);
     delState(state);
 
-    // 🔥 redirect alla dashboard dell’app
+    // redirect alla dashboard dell’app
     return res.redirect(`${SHOPIFY_APP_URL}/app?shop=${encodeURIComponent(shop)}`);
   } catch (e) {
     console.error("/auth/callback error:", e);
@@ -224,12 +218,16 @@ app.get("/app", async (req, res) => {
 
     const token = await getShopToken(shop);
     if (!token) {
+      // qui NON hardcodiamo shop: usiamo quello richiesto
       return res
         .status(401)
-        .send("App non installata o token mancante. Reinstalla: /auth?shop=e9d9c4-38.myshopify.com");
+        .send(
+          `App non installata o token mancante per ${shop}. Reinstalla: ${SHOPIFY_APP_URL}/auth?shop=${encodeURIComponent(
+            shop
+          )}`
+        );
     }
 
-    // Dashboard HTML (snella)
     return res.status(200).send(`<!doctype html>
 <html lang="it">
 <head>
@@ -306,8 +304,8 @@ app.get("/app", async (req, res) => {
     <div class="card" style="margin-top:12px">
       <div style="font-weight:700;margin-bottom:6px">Azioni rapide</div>
       <div class="muted">
-        • Se l’app risulta “vuota”, apri: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
-        • Installazione: <b>${SHOPIFY_APP_URL}/auth?shop=e9d9c4-38.myshopify.com</b>
+        • Apri dashboard: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
+        • Reinstall: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
       </div>
     </div>
   </div>
@@ -390,7 +388,6 @@ async function syncNow(){
 
 document.getElementById("refreshBtn").addEventListener("click", loadRuns);
 document.getElementById("syncBtn").addEventListener("click", syncNow);
-
 loadRuns();
 </script>
 </body>
@@ -430,7 +427,6 @@ app.get("/api/run/:id", async (req, res) => {
 
     const data = await getRunWithLogs(runId, 400);
 
-    // (extra sicurezza minimale) se il run non appartiene allo shop, non mostrarlo
     if (data.run && data.run.shop_domain && data.run.shop_domain !== shop) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -452,13 +448,13 @@ app.post("/api/sync/run", async (req, res) => {
     if (!token) return res.status(401).json({ error: "not installed" });
 
     const runId = await createRun({ shopDomain: shop, trigger, summary: { mode: "demo" } });
+
     await addRunLog(runId, { level: "info", message: "Sync avviata (demo)." });
     await addRunLog(runId, { level: "info", message: "Controllo token Shopify: OK" });
     await addRunLog(runId, { level: "info", message: "Step 1/3: lettura dati… (demo)" });
     await addRunLog(runId, { level: "info", message: "Step 2/3: confronto… (demo)" });
     await addRunLog(runId, { level: "info", message: "Step 3/3: aggiornamento… (demo)" });
 
-    // qui poi agganceremo la vera sync Amazon/eBay
     await finishRun(runId, {
       status: "success",
       summary: { done: true, note: "Demo sync completed" },
@@ -475,9 +471,13 @@ app.post("/api/sync/run", async (req, res) => {
 
 // ---------- Root ----------
 app.get("/", (req, res) => {
-  res.status(200).send(
-    "Sync CarpeDiem - server online. Usa /auth?shop=e9d9c4-38.myshopify.com per installare. Dashboard: /app?shop=e9d9c4-38.myshopify.com"
-  );
+  res
+    .status(200)
+    .send(
+      "Sync CarpeDiem - server online. " +
+        "Install: /auth?shop=e9d9c4-38.myshopify.com " +
+        "Dashboard: /app?shop=e9d9c4-38.myshopify.com"
+    );
 });
 
 // ---------- Start ----------
