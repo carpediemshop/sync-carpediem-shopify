@@ -226,7 +226,7 @@ app.get("/app", async (req, res) => {
     if (!token) {
       return res
         .status(401)
-        .send("App non installata o token mancante. Reinstalla: /auth?shop=TUO-SHOP.myshopify.com");
+        .send("App non installata o token mancante. Reinstalla: /auth?shop=e9d9c4-38.myshopify.com");
     }
 
     // Dashboard HTML (snella)
@@ -307,7 +307,7 @@ app.get("/app", async (req, res) => {
       <div style="font-weight:700;margin-bottom:6px">Azioni rapide</div>
       <div class="muted">
         • Se l’app risulta “vuota”, apri: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
-        • Installazione: <b>${SHOPIFY_APP_URL}/auth?shop=TUO-SHOP.myshopify.com</b>
+        • Installazione: <b>${SHOPIFY_APP_URL}/auth?shop=e9d9c4-38.myshopify.com</b>
       </div>
     </div>
   </div>
@@ -476,7 +476,7 @@ app.post("/api/sync/run", async (req, res) => {
 // ---------- Root ----------
 app.get("/", (req, res) => {
   res.status(200).send(
-    "Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare. Dashboard: /app?shop=TUO-SHOP.myshopify.com"
+    "Sync CarpeDiem - server online. Usa /auth?shop=e9d9c4-38.myshopify.com per installare. Dashboard: /app?shop=e9d9c4-38.myshopify.com"
   );
 });
 
