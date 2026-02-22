@@ -9,12 +9,48 @@ const { shopifyApi, LATEST_API_VERSION } = require("@shopify/shopify-api");
 const { initDb, upsertShopToken, getShopToken } = require("./db");
 
 const app = express();
+
+// IMPORTANT: behind Render proxy
 app.set("trust proxy", 1);
 
-// Health (Render)
+// --------------------
+// 1) HEALTH (always)
+// --------------------
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
-// JSON for normal routes
+// --------------------
+// 2) WEBHOOK RAW BODY (must be BEFORE json middleware)
+// --------------------
+app.post(
+  "/webhooks/shopify",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const topic = req.get("X-Shopify-Topic");
+      const shop = req.get("X-Shopify-Shop-Domain");
+      const hmac = req.get("X-Shopify-Hmac-Sha256");
+      const rawBody = req.body.toString("utf8");
+
+      if (!verifyWebhook(rawBody, hmac)) {
+        return res.status(401).send("Invalid webhook signature");
+      }
+
+      // payload available if you need it:
+      // const payload = JSON.parse(rawBody);
+
+      console.log("✅ Webhook received", { topic, shop });
+
+      return res.status(200).send("ok");
+    } catch (e) {
+      console.error("Webhook error:", e);
+      if (!res.headersSent) return res.status(500).send("error");
+    }
+  }
+);
+
+// --------------------
+// 3) JSON middleware for normal routes
+// --------------------
 app.use(bodyParser.json({ type: "application/json" }));
 
 const {
@@ -26,7 +62,9 @@ const {
 } = process.env;
 
 if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET || !SHOPIFY_APP_URL) {
-  console.warn("Missing env vars: SHOPIFY_CLIENT_ID/SHOPIFY_CLIENT_SECRET/SHOPIFY_APP_URL");
+  console.warn(
+    "Missing env vars: SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET / SHOPIFY_APP_URL"
+  );
 }
 
 const apiVersion = SHOPIFY_API_VERSION || LATEST_API_VERSION;
@@ -39,76 +77,54 @@ const shopify = shopifyApi({
   apiVersion,
 });
 
-/** Utils **/
-function verifyShopifyHmac(query) {
-  const { hmac, ...map } = query;
-
-  const message = Object.keys(map)
-    .sort()
-    .map((key) => `${key}=${Array.isArray(map[key]) ? map[key].join(",") : map[key]}`)
-    .join("&");
-
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
-    .update(message)
-    .digest("hex");
-
-  // timingSafeEqual vuole buffer stessa lunghezza
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(hmac || "", "utf8");
-  if (a.length !== b.length) return false;
-
-  return crypto.timingSafeEqual(a, b);
-}
-
-function verifyWebhook(rawBody, hmacHeader) {
-  // Shopify sends base64 HMAC in X-Shopify-Hmac-Sha256
-  const secret = SHOPIFY_WEBHOOK_SECRET || SHOPIFY_CLIENT_SECRET;
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("base64");
-
-  const a = Buffer.from(digest, "utf8");
-  const b = Buffer.from(hmacHeader || "", "utf8");
-  if (a.length !== b.length) return false;
-
-  return crypto.timingSafeEqual(a, b);
-}
-
-/** Home **/
+// --------------------
+// HOME
+// --------------------
 app.get("/", (req, res) => {
   res
     .status(200)
-    .send("Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare.");
+    .send(
+      "Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare."
+    );
 });
 
-/**
- * OAuth start
- * Esempio:
- * https://sync-carpediem.onrender.com/auth?shop=carpediemstore.myshopify.com
- */
+// --------------------
+// AUTH START
+// Example: https://sync-carpediem.onrender.com/auth?shop=XXXX.myshopify.com
+// --------------------
 app.get("/auth", async (req, res) => {
-  const { shop } = req.query;
-  if (!shop) return res.status(400).send("Missing ?shop=");
+  try {
+    const shop = String(req.query.shop || "").trim();
 
-  // opzionale: se Shopify manda hmac nel redirect, lo verifichiamo
-  if (req.query.hmac && !verifyShopifyHmac(req.query)) {
-    return res.status(401).send("Invalid HMAC");
+    if (!shop) return res.status(400).send("Missing ?shop=");
+    if (!shop.endsWith(".myshopify.com"))
+      return res.status(400).send("Shop must end with .myshopify.com");
+
+    // Optional HMAC check if present
+    if (req.query.hmac && !verifyShopifyHmac(req.query)) {
+      return res.status(401).send("Invalid HMAC");
+    }
+
+    const redirectUrl = await shopify.auth.begin({
+      shop,
+      callbackPath: "/auth/callback",
+      isOnline: false,
+      rawRequest: req,
+      rawResponse: res,
+    });
+
+    // IMPORTANT: ensure we send only once
+    if (res.headersSent) return;
+    return res.redirect(redirectUrl);
+  } catch (e) {
+    console.error("Auth begin error:", e);
+    if (!res.headersSent) return res.status(500).send("Auth begin error: " + e.message);
   }
-
-  const redirectUrl = await shopify.auth.begin({
-    shop,
-    callbackPath: "/auth/callback",
-    isOnline: false,
-    rawRequest: req,
-    rawResponse: res,
-  });
-
-  return res.redirect(redirectUrl);
 });
 
+// --------------------
+// AUTH CALLBACK
+// --------------------
 app.get("/auth/callback", async (req, res) => {
   try {
     const { session } = await shopify.auth.callback({
@@ -116,47 +132,25 @@ app.get("/auth/callback", async (req, res) => {
       rawResponse: res,
     });
 
-    // salva token
     await upsertShopToken(session.shop, session.accessToken);
 
-    // registra webhooks
+    // Register webhooks after install
     await registerWebhooks(session.shop);
 
+    if (res.headersSent) return;
     return res
       .status(200)
-      .send("✅ App autorizzata. Ora puoi chiudere questa pagina e aprire l’app da Shopify Admin.");
+      .send("✅ App autorizzata. Installazione completata.");
   } catch (e) {
-    console.error(e);
-    return res.status(500).send("OAuth callback error: " + e.message);
+    console.error("OAuth callback error:", e);
+    if (!res.headersSent)
+      return res.status(500).send("OAuth callback error: " + e.message);
   }
 });
 
-/** Shopify webhook endpoint **/
-app.post("/webhooks/shopify", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  const topic = req.get("X-Shopify-Topic");
-  const shop = req.get("X-Shopify-Shop-Domain");
-  const hmac = req.get("X-Shopify-Hmac-Sha256");
-  const rawBody = req.body.toString("utf8");
-
-  if (!verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send("Invalid webhook signature");
-  }
-
-  try {
-    const payload = JSON.parse(rawBody);
-
-    // per ora solo log
-    console.log("Webhook ricevuto", { topic, shop });
-    // console.log(payload);
-
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("Webhook error", e);
-    return res.status(500).send("error");
-  }
-});
-
-/** Register required webhooks **/
+// --------------------
+// REGISTER WEBHOOKS
+// --------------------
 async function registerWebhooks(shopDomain) {
   const token = await getShopToken(shopDomain);
   if (!token) throw new Error("Missing token for shop " + shopDomain);
@@ -174,31 +168,67 @@ async function registerWebhooks(shopDomain) {
     try {
       await client.post({
         path: "webhooks",
-        data: {
-          webhook: {
-            topic: h.topic,
-            address: h.address,
-            format: "json",
-          },
-        },
+        data: { webhook: { topic: h.topic, address: h.address, format: "json" } },
       });
-      console.log("Webhook registered", h.topic);
+      console.log("✅ Webhook registered:", h.topic);
     } catch (e) {
-      console.log("Webhook register failed", h.topic, e?.response?.body || e.message);
+      console.log("⚠️ Webhook register failed:", h.topic, e?.response?.body || e.message);
     }
   }
 }
 
-/** Polling skeleton (ogni 2 minuti) **/
+// --------------------
+// HMAC utils
+// --------------------
+function verifyShopifyHmac(query) {
+  const { hmac, ...map } = query;
+
+  const message = Object.keys(map)
+    .sort()
+    .map((key) => `${key}=${Array.isArray(map[key]) ? map[key].join(",") : map[key]}`)
+    .join("&");
+
+  const digest = crypto
+    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+    .update(message)
+    .digest("hex");
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac || ""));
+  } catch {
+    return false;
+  }
+}
+
+function verifyWebhook(rawBody, hmacHeader) {
+  const secret = SHOPIFY_WEBHOOK_SECRET || SHOPIFY_CLIENT_SECRET;
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody, "utf8")
+    .digest("base64");
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || ""));
+  } catch {
+    return false;
+  }
+}
+
+// --------------------
+// CRON (placeholder)
+// --------------------
 cron.schedule("*/2 * * * *", async () => {
   try {
-    // TODO: Amazon/eBay polling
+    // TODO later
   } catch (e) {
-    console.error("Cron error", e.message);
+    console.error("Cron error:", e.message);
   }
 });
 
-/** Start **/
+// --------------------
+// START
+// --------------------
 initDb()
   .then(() => {
     const PORT = process.env.PORT || 3000;
