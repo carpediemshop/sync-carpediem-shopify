@@ -6,12 +6,21 @@ const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const cron = require("node-cron");
 const { shopifyApi, LATEST_API_VERSION } = require("@shopify/shopify-api");
-const { initDb, upsertShopToken, getShopToken, markProcessed, isProcessed } = require("./db");
+
+const {
+  initDb,
+  upsertShopToken,
+  getShopToken,
+  markProcessed,
+  isProcessed
+} = require("./db");
 
 const app = express();
-app.get("/health", (req, res) => res.status(200).send("ok"));
+
+// JSON per le normali route
 app.use(bodyParser.json({ type: "application/json" }));
 
+/** ENV **/
 const {
   SHOPIFY_CLIENT_ID,
   SHOPIFY_CLIENT_SECRET,
@@ -26,22 +35,19 @@ if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET || !SHOPIFY_APP_URL) {
 
 const apiVersion = SHOPIFY_API_VERSION || LATEST_API_VERSION;
 
+// Shopify SDK
 const shopify = shopifyApi({
   apiKey: SHOPIFY_CLIENT_ID,
   apiSecretKey: SHOPIFY_CLIENT_SECRET,
-  scopes: [
-    "read_products",
-    "read_inventory",
-    "write_inventory",
-    "read_orders"
-  ],
+  scopes: ["read_products", "read_inventory", "write_inventory", "read_orders"],
   hostName: new URL(SHOPIFY_APP_URL).host,
   apiVersion
 });
 
 /** Utils **/
 function verifyShopifyHmac(query) {
-  const { hmac, ...map } = query;
+  // Verifica HMAC per /auth e callback (querystring)
+  const { hmac, signature, ...map } = query; // signature a volte presente
   const message = Object.keys(map)
     .sort()
     .map((key) => `${key}=${Array.isArray(map[key]) ? map[key].join(",") : map[key]}`)
@@ -52,30 +58,50 @@ function verifyShopifyHmac(query) {
     .update(message)
     .digest("hex");
 
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac || ""));
+  // timingSafeEqual vuole buffer della stessa lunghezza
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(hmac || "", "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 function verifyWebhook(rawBody, hmacHeader) {
-  // Shopify sends base64 HMAC in X-Shopify-Hmac-Sha256
+  // Shopify manda base64 in X-Shopify-Hmac-Sha256
+  const secret = SHOPIFY_WEBHOOK_SECRET || SHOPIFY_CLIENT_SECRET;
+
   const digest = crypto
-    .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET || SHOPIFY_CLIENT_SECRET)
+    .createHmac("sha256", secret)
     .update(rawBody, "utf8")
     .digest("base64");
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || ""));
+
+  const a = Buffer.from(digest, "utf8");
+  const b = Buffer.from(hmacHeader || "", "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 }
 
 /** Health **/
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
+/** Home **/
+app.get("/", (req, res) => {
+  res
+    .status(200)
+    .send("Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare.");
+});
+
 /**
- * Install / OAuth start
- * Open: https://sync-carpediem.onrender.com/auth?shop=YOURSHOP.myshopify.com
+ * OAuth start
+ * Apri:
+ * https://sync-carpediem.onrender.com/auth?shop=carpediemstore.it  (NO)
+ * Deve essere dominio Shopify:
+ * https://sync-carpediem.onrender.com/auth?shop=TUOSHOP.myshopify.com
  */
 app.get("/auth", async (req, res) => {
   const { shop } = req.query;
   if (!shop) return res.status(400).send("Missing ?shop=");
 
-  // optional HMAC check if present
+  // opzionale: se Shopify manda hmac, verifichiamo
   if (req.query.hmac && !verifyShopifyHmac(req.query)) {
     return res.status(401).send("Invalid HMAC");
   }
@@ -93,67 +119,71 @@ app.get("/auth", async (req, res) => {
 
 app.get("/auth/callback", async (req, res) => {
   try {
+    // se vuoi essere super-stricto, puoi anche verificare req.query.hmac qui
     const { session } = await shopify.auth.callback({
       rawRequest: req,
       rawResponse: res
     });
 
-    // Save token
     await upsertShopToken(session.shop, session.accessToken);
 
-    // Register webhooks we need (orders + inventory)
     await registerWebhooks(session.shop);
 
-    res.status(200).send(
-      "✅ App autorizzata. Ora puoi chiudere questa pagina e aprire l’app da Shopify Admin."
-    );
+    return res
+      .status(200)
+      .send("✅ App autorizzata. Ora puoi chiudere questa pagina e aprire l’app da Shopify Admin.");
   } catch (e) {
-    console.error(e);
-    res.status(500).send("OAuth callback error: " + e.message);
+    console.error("OAuth callback error:", e);
+    return res.status(500).send("OAuth callback error: " + e.message);
   }
 });
 
-/** Shopify webhook endpoint **/
+/** Webhook endpoint (RAW BODY!) **/
 app.post("/webhooks/shopify", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   const topic = req.get("X-Shopify-Topic");
   const shop = req.get("X-Shopify-Shop-Domain");
   const hmac = req.get("X-Shopify-Hmac-Sha256");
+
   const rawBody = req.body.toString("utf8");
 
   if (!verifyWebhook(rawBody, hmac)) {
     return res.status(401).send("Invalid webhook signature");
   }
 
-  const payload = JSON.parse(rawBody);
+  let payload;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch (e) {
+    return res.status(400).send("Invalid JSON");
+  }
 
   try {
-    // For now we only log. In the next steps we will:
-    // - On orders/create: compute per-SKU quantities and adjust inventory
-    // - On inventory_levels/update: propagate to Amazon/eBay
-    console.log("Webhook", { topic, shop });
+    // TODO: qui poi mettiamo la logica vera (ordini -> inventory)
+    console.log("Webhook received:", { topic, shop });
 
-    res.status(200).send("ok");
+    // esempio anti-duplicati (se vuoi usarlo più avanti):
+    // const eventId = req.get("X-Shopify-Webhook-Id") || `${shop}:${topic}:${payload?.id || ""}`;
+    // if (await isProcessed(eventId)) return res.status(200).send("dup");
+    // await markProcessed(eventId);
+
+    return res.status(200).send("ok");
   } catch (e) {
-    console.error("Webhook error", e);
-    res.status(500).send("error");
+    console.error("Webhook handler error:", e);
+    return res.status(500).send("error");
   }
 });
 
-/** Simple home **/
-app.get("/", (req, res) => {
-  res.status(200).send(
-    "Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare."
-  );
-});
-
-/** Register required webhooks **/
+/** Register webhooks **/
 async function registerWebhooks(shopDomain) {
   const token = await getShopToken(shopDomain);
   if (!token) throw new Error("Missing token for shop " + shopDomain);
 
-  const client = new shopify.clients.Rest({ shop: shopDomain, accessToken: token });
+  // ✅ modo compatibile con @shopify/shopify-api recente: client con session
+  const session = shopify.session.customAppSession(shopDomain);
+  session.accessToken = token;
 
-  // topics we need
+  const client = new shopify.clients.Rest({ session });
+
   const hooks = [
     { topic: "orders/create", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
     { topic: "orders/cancelled", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
@@ -173,37 +203,30 @@ async function registerWebhooks(shopDomain) {
           }
         }
       });
-      console.log("Webhook registered", h.topic);
+      console.log("Webhook registered:", h.topic);
     } catch (e) {
-      console.log("Webhook register failed", h.topic, e?.response?.body || e.message);
+      console.log("Webhook register failed:", h.topic, e?.response?.body || e.message);
     }
   }
 }
 
 /**
- * Polling skeleton (every 2 minutes)
- * NOTE: On Render Free this is NOT reliable because the service sleeps.
- * When we switch to paid instance, polling becomes reliable.
+ * Polling skeleton (ogni 2 minuti)
+ * Render Free “dorme” → non affidabile.
  */
 cron.schedule("*/2 * * * *", async () => {
   try {
-    // TODO: Amazon/eBay polling here
-    // - fetch new orders
-    // - if not processed -> decrement Shopify inventory by SKU
-    // - mark processed
-    // - update other channels with new qty
+    // TODO: qui in futuro Amazon/eBay polling
   } catch (e) {
-    console.error("Cron error", e.message);
+    console.error("Cron error:", e.message);
   }
 });
 
+/** START **/
 initDb()
   .then(() => {
     const PORT = process.env.PORT || 3000;
-
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-    });
+    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
   .catch((e) => {
     console.error("DB init failed:", e);
