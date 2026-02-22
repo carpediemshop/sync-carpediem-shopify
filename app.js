@@ -19,6 +19,7 @@ const {
 const app = express();
 app.set("trust proxy", 1);
 
+// JSON per API
 app.use(bodyParser.json({ limit: "2mb" }));
 
 // ---------- ENV ----------
@@ -30,9 +31,7 @@ const {
 } = process.env;
 
 if (!SHOPIFY_APP_URL || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
-  console.error(
-    "Missing env. Required: SHOPIFY_APP_URL, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET"
-  );
+  console.error("Missing env. Required: SHOPIFY_APP_URL, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET");
 }
 
 // Scopes
@@ -40,15 +39,12 @@ const SCOPES = ["read_products", "write_inventory", "read_orders"].join(",");
 
 // ---------- helpers ----------
 function isValidShop(shop) {
-  return (
-    typeof shop === "string" &&
-    /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop)
-  );
+  return typeof shop === "string" && /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop);
 }
 
 function timingSafeEqual(a, b) {
-  const aBuf = Buffer.from(a, "utf8");
-  const bBuf = Buffer.from(b, "utf8");
+  const aBuf = Buffer.from(a || "", "utf8");
+  const bBuf = Buffer.from(b || "", "utf8");
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
@@ -60,9 +56,7 @@ function verifyOAuthHmac(query, secret) {
 
   const message = Object.keys(rest)
     .sort()
-    .map(
-      (key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`
-    )
+    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
     .join("&");
 
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
@@ -111,31 +105,24 @@ function setShopifyCsp(req, res) {
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
 // ---------- 2) WEBHOOK endpoint (opzionale) ----------
-app.post(
-  "/webhooks/shopify",
-  bodyParser.raw({ type: "application/json" }),
-  (req, res) => {
-    try {
-      if (!SHOPIFY_WEBHOOK_SECRET) return res.status(200).send("ok");
+app.post("/webhooks/shopify", bodyParser.raw({ type: "application/json" }), (req, res) => {
+  try {
+    if (!SHOPIFY_WEBHOOK_SECRET) return res.status(200).send("ok");
 
-      const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
-      const body = req.body; // Buffer
-      const digest = crypto
-        .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
-        .update(body)
-        .digest("base64");
+    const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
+    const body = req.body; // Buffer
+    const digest = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(body).digest("base64");
 
-      if (!hmacHeader || !timingSafeEqual(digest, hmacHeader)) {
-        return res.status(401).send("invalid webhook hmac");
-      }
-
-      return res.status(200).send("ok");
-    } catch (e) {
-      console.error("Webhook error:", e);
-      return res.status(500).send("error");
+    if (!hmacHeader || !timingSafeEqual(digest, hmacHeader)) {
+      return res.status(401).send("invalid webhook hmac");
     }
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("Webhook error:", e);
+    return res.status(500).send("error");
   }
-);
+});
 
 // ---------- 3) OAUTH START ----------
 app.get("/auth", (req, res) => {
@@ -200,7 +187,7 @@ app.get("/auth/callback", async (req, res) => {
     await upsertShopToken(shop, accessToken);
     delState(state);
 
-    // redirect alla dashboard dell’app
+    // redirect dashboard
     return res.redirect(`${SHOPIFY_APP_URL}/app?shop=${encodeURIComponent(shop)}`);
   } catch (e) {
     console.error("/auth/callback error:", e);
@@ -218,7 +205,6 @@ app.get("/app", async (req, res) => {
 
     const token = await getShopToken(shop);
     if (!token) {
-      // qui NON hardcodiamo shop: usiamo quello richiesto
       return res
         .status(401)
         .send(
@@ -304,8 +290,8 @@ app.get("/app", async (req, res) => {
     <div class="card" style="margin-top:12px">
       <div style="font-weight:700;margin-bottom:6px">Azioni rapide</div>
       <div class="muted">
-        • Apri dashboard: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
-        • Reinstall: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
+        • Dashboard diretta: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
+        • Reinstall token: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
       </div>
     </div>
   </div>
@@ -426,7 +412,6 @@ app.get("/api/run/:id", async (req, res) => {
     if (!token) return res.status(401).json({ error: "not installed" });
 
     const data = await getRunWithLogs(runId, 400);
-
     if (data.run && data.run.shop_domain && data.run.shop_domain !== shop) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -448,18 +433,13 @@ app.post("/api/sync/run", async (req, res) => {
     if (!token) return res.status(401).json({ error: "not installed" });
 
     const runId = await createRun({ shopDomain: shop, trigger, summary: { mode: "demo" } });
-
     await addRunLog(runId, { level: "info", message: "Sync avviata (demo)." });
     await addRunLog(runId, { level: "info", message: "Controllo token Shopify: OK" });
     await addRunLog(runId, { level: "info", message: "Step 1/3: lettura dati… (demo)" });
     await addRunLog(runId, { level: "info", message: "Step 2/3: confronto… (demo)" });
     await addRunLog(runId, { level: "info", message: "Step 3/3: aggiornamento… (demo)" });
 
-    await finishRun(runId, {
-      status: "success",
-      summary: { done: true, note: "Demo sync completed" },
-    });
-
+    await finishRun(runId, { status: "success", summary: { done: true, note: "Demo sync completed" } });
     await addRunLog(runId, { level: "info", message: "Sync completata con successo (demo)." });
 
     return res.json({ ok: true, runId });
@@ -471,13 +451,11 @@ app.post("/api/sync/run", async (req, res) => {
 
 // ---------- Root ----------
 app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send(
-      "Sync CarpeDiem - server online. " +
-        "Install: /auth?shop=e9d9c4-38.myshopify.com " +
-        "Dashboard: /app?shop=e9d9c4-38.myshopify.com"
-    );
+  res.status(200).send(
+    `Sync CarpeDiem - server online.
+Esempio install: ${SHOPIFY_APP_URL}/auth?shop=e9d9c4-38.myshopify.com
+Esempio dashboard: ${SHOPIFY_APP_URL}/app?shop=e9d9c4-38.myshopify.com`
+  );
 });
 
 // ---------- Start ----------
