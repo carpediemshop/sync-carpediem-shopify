@@ -4,237 +4,221 @@ require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
 const crypto = require("crypto");
-const cron = require("node-cron");
-const { shopifyApi, LATEST_API_VERSION } = require("@shopify/shopify-api");
-const { initDb, upsertShopToken, getShopToken } = require("./db");
+
+const { initDb, upsertShopToken } = require("./db");
 
 const app = express();
-
-// IMPORTANT: behind Render proxy
 app.set("trust proxy", 1);
 
-// --------------------
-// 1) HEALTH (always)
-// --------------------
+// ---------- ENV ----------
+const {
+  SHOPIFY_APP_URL,
+  SHOPIFY_CLIENT_ID,
+  SHOPIFY_CLIENT_SECRET,
+  SHOPIFY_WEBHOOK_SECRET,
+} = process.env;
+
+if (!SHOPIFY_APP_URL || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+  console.error("Missing env. Required: SHOPIFY_APP_URL, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET");
+}
+
+// Scopes: tienili coerenti con ciò che vuoi fare
+const SCOPES = [
+  "read_products",
+  "write_inventory",
+  "read_orders",
+].join(",");
+
+// ---------- helpers ----------
+function isValidShop(shop) {
+  return typeof shop === "string" && /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop);
+}
+
+function timingSafeEqual(a, b) {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+// Shopify OAuth HMAC verification (querystring)
+function verifyOAuthHmac(query, secret) {
+  const { hmac, signature, ...rest } = query;
+  if (!hmac) return false;
+
+  const message = Object.keys(rest)
+    .sort()
+    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
+    .join("&");
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
+
+  return timingSafeEqual(digest, hmac);
+}
+
+function randomState() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+// Memoria per state OAuth (ok per ora; in produzione meglio DB/Redis)
+const oauthStates = new Map(); // state -> { shop, host, createdAt }
+const STATE_TTL_MS = 10 * 60 * 1000;
+
+function putState(state, payload) {
+  oauthStates.set(state, { ...payload, createdAt: Date.now() });
+}
+function getState(state) {
+  const v = oauthStates.get(state);
+  if (!v) return null;
+  if (Date.now() - v.createdAt > STATE_TTL_MS) {
+    oauthStates.delete(state);
+    return null;
+  }
+  return v;
+}
+function delState(state) {
+  oauthStates.delete(state);
+}
+
+// ---------- 1) HEALTH ----------
 app.get("/health", (req, res) => res.status(200).send("ok"));
 
-// --------------------
-// 2) WEBHOOK RAW BODY (must be BEFORE json middleware)
-// --------------------
+// ---------- 2) WEBHOOK endpoint (opzionale) ----------
 app.post(
   "/webhooks/shopify",
   bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
+  (req, res) => {
     try {
-      const topic = req.get("X-Shopify-Topic");
-      const shop = req.get("X-Shopify-Shop-Domain");
-      const hmac = req.get("X-Shopify-Hmac-Sha256");
-      const rawBody = req.body.toString("utf8");
-
-      if (!verifyWebhook(rawBody, hmac)) {
-        return res.status(401).send("Invalid webhook signature");
+      if (!SHOPIFY_WEBHOOK_SECRET) {
+        // Se non usi webhooks adesso, rispondi 200 e basta
+        return res.status(200).send("ok");
       }
 
-      // payload available if you need it:
-      // const payload = JSON.parse(rawBody);
+      const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
+      const body = req.body; // Buffer
+      const digest = crypto
+        .createHmac("sha256", SHOPIFY_WEBHOOK_SECRET)
+        .update(body)
+        .digest("base64");
 
-      console.log("✅ Webhook received", { topic, shop });
+      if (!hmacHeader || !timingSafeEqual(digest, hmacHeader)) {
+        return res.status(401).send("invalid webhook hmac");
+      }
 
+      // Qui puoi gestire i topic se vuoi
+      // const topic = req.get("X-Shopify-Topic");
       return res.status(200).send("ok");
     } catch (e) {
       console.error("Webhook error:", e);
-      if (!res.headersSent) return res.status(500).send("error");
+      return res.status(500).send("error");
     }
   }
 );
 
-// --------------------
-// 3) JSON middleware for normal routes
-// --------------------
-app.use(bodyParser.json({ type: "application/json" }));
-
-const {
-  SHOPIFY_CLIENT_ID,
-  SHOPIFY_CLIENT_SECRET,
-  SHOPIFY_APP_URL,
-  SHOPIFY_API_VERSION,
-  SHOPIFY_WEBHOOK_SECRET,
-} = process.env;
-
-if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET || !SHOPIFY_APP_URL) {
-  console.warn(
-    "Missing env vars: SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET / SHOPIFY_APP_URL"
-  );
-}
-
-const apiVersion = SHOPIFY_API_VERSION || LATEST_API_VERSION;
-
-const shopify = shopifyApi({
-  apiKey: SHOPIFY_CLIENT_ID,
-  apiSecretKey: SHOPIFY_CLIENT_SECRET,
-  scopes: ["read_products", "read_inventory", "write_inventory", "read_orders"],
-  hostName: new URL(SHOPIFY_APP_URL).host,
-  apiVersion,
-});
-
-// --------------------
-// HOME
-// --------------------
-app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send(
-      "Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare."
-    );
-});
-
-// --------------------
-// AUTH START
-// Example: https://sync-carpediem.onrender.com/auth?shop=XXXX.myshopify.com
-// --------------------
-app.get("/auth", async (req, res) => {
+// ---------- 3) OAUTH START ----------
+app.get("/auth", (req, res) => {
   try {
-    const shop = String(req.query.shop || "").trim();
-
-    if (!shop) return res.status(400).send("Missing ?shop=");
-    if (!shop.endsWith(".myshopify.com"))
-      return res.status(400).send("Shop must end with .myshopify.com");
-
-    // Optional HMAC check if present
-    if (req.query.hmac && !verifyShopifyHmac(req.query)) {
-      return res.status(401).send("Invalid HMAC");
+    const shop = req.query.shop;
+    const host = req.query.host; // a volte Shopify lo passa (embedded)
+    if (!isValidShop(shop)) {
+      return res.status(400).send("Invalid or missing shop parameter");
     }
 
-    const redirectUrl = await shopify.auth.begin({
-      shop,
-      callbackPath: "/auth/callback",
-      isOnline: false,
-      rawRequest: req,
-      rawResponse: res,
-    });
+    const state = randomState();
+    putState(state, { shop, host: host || "" });
 
-    // IMPORTANT: ensure we send only once
-    if (res.headersSent) return;
-    return res.redirect(redirectUrl);
+    const redirectUri = `${SHOPIFY_APP_URL}/auth/callback`;
+
+    const installUrl =
+      `https://${shop}/admin/oauth/authorize` +
+      `?client_id=${encodeURIComponent(SHOPIFY_CLIENT_ID)}` +
+      `&scope=${encodeURIComponent(SCOPES)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&state=${encodeURIComponent(state)}`;
+
+    // IMPORTANT: un solo redirect, e poi return
+    return res.redirect(installUrl);
   } catch (e) {
-    console.error("Auth begin error:", e);
-    if (!res.headersSent) return res.status(500).send("Auth begin error: " + e.message);
+    console.error("/auth error:", e);
+    return res.status(500).send("Auth start error");
   }
 });
 
-// --------------------
-// AUTH CALLBACK
-// --------------------
+// ---------- 4) OAUTH CALLBACK ----------
 app.get("/auth/callback", async (req, res) => {
   try {
-    const { session } = await shopify.auth.callback({
-      rawRequest: req,
-      rawResponse: res,
+    const { shop, code, state } = req.query;
+
+    if (!isValidShop(shop)) return res.status(400).send("Invalid shop");
+    if (!code || !state) return res.status(400).send("Missing code/state");
+
+    const st = getState(state);
+    if (!st || st.shop !== shop) {
+      return res.status(400).send("Invalid/expired state");
+    }
+
+    // Verifica HMAC OAuth
+    const okHmac = verifyOAuthHmac(req.query, SHOPIFY_CLIENT_SECRET);
+    if (!okHmac) return res.status(400).send("HMAC validation failed");
+
+    // Scambio code -> access_token
+    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code,
+      }),
     });
 
-    await upsertShopToken(session.shop, session.accessToken);
-
-    // Register webhooks after install
-    await registerWebhooks(session.shop);
-
-    if (res.headersSent) return;
-    return res
-      .status(200)
-      .send("✅ App autorizzata. Installazione completata.");
-  } catch (e) {
-    console.error("OAuth callback error:", e);
-    if (!res.headersSent)
-      return res.status(500).send("OAuth callback error: " + e.message);
-  }
-});
-
-// --------------------
-// REGISTER WEBHOOKS
-// --------------------
-async function registerWebhooks(shopDomain) {
-  const token = await getShopToken(shopDomain);
-  if (!token) throw new Error("Missing token for shop " + shopDomain);
-
-  const client = new shopify.clients.Rest({ shop: shopDomain, accessToken: token });
-
-  const hooks = [
-    { topic: "orders/create", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
-    { topic: "orders/cancelled", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
-    { topic: "inventory_levels/update", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
-    { topic: "products/update", address: `${SHOPIFY_APP_URL}/webhooks/shopify` },
-  ];
-
-  for (const h of hooks) {
-    try {
-      await client.post({
-        path: "webhooks",
-        data: { webhook: { topic: h.topic, address: h.address, format: "json" } },
-      });
-      console.log("✅ Webhook registered:", h.topic);
-    } catch (e) {
-      console.log("⚠️ Webhook register failed:", h.topic, e?.response?.body || e.message);
+    if (!tokenResp.ok) {
+      const txt = await tokenResp.text().catch(() => "");
+      console.error("Token exchange failed:", tokenResp.status, txt);
+      return res.status(500).send("Token exchange failed");
     }
-  }
-}
 
-// --------------------
-// HMAC utils
-// --------------------
-function verifyShopifyHmac(query) {
-  const { hmac, ...map } = query;
+    const data = await tokenResp.json();
+    const accessToken = data.access_token;
+    if (!accessToken) return res.status(500).send("Missing access token");
 
-  const message = Object.keys(map)
-    .sort()
-    .map((key) => `${key}=${Array.isArray(map[key]) ? map[key].join(",") : map[key]}`)
-    .join("&");
+    // Salva token (DB se presente, altrimenti fallback in-memory nel tuo db.js)
+    await upsertShopToken(shop, accessToken);
 
-  const digest = crypto
-    .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
-    .update(message)
-    .digest("hex");
+    // Stato usato -> rimuovi
+    delState(state);
 
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac || ""));
-  } catch {
-    return false;
-  }
-}
-
-function verifyWebhook(rawBody, hmacHeader) {
-  const secret = SHOPIFY_WEBHOOK_SECRET || SHOPIFY_CLIENT_SECRET;
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("base64");
-
-  try {
-    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader || ""));
-  } catch {
-    return false;
-  }
-}
-
-// --------------------
-// CRON (placeholder)
-// --------------------
-cron.schedule("*/2 * * * *", async () => {
-  try {
-    // TODO later
+    // Redirect finale (semplice)
+    // Per ora mando alla pagina App in Shopify Admin (lista app)
+    // Se vuoi dopo lo rendiamo embedded con App Bridge ecc.
+    return res.redirect(`https://${shop}/admin/apps`);
   } catch (e) {
-    console.error("Cron error:", e.message);
+    console.error("/auth/callback error:", e);
+    return res.status(500).send("Auth callback error");
   }
 });
 
-// --------------------
-// START
-// --------------------
-initDb()
-  .then(() => {
-    const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-  })
-  .catch((e) => {
-    console.error("DB init failed:", e);
-    process.exit(1);
+// ---------- Root ----------
+app.get("/", (req, res) => {
+  res.status(200).send(
+    "Sync CarpeDiem - server online. Usa /auth?shop=TUO-SHOP.myshopify.com per installare."
+  );
+});
+
+// ---------- Start ----------
+(async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    console.error("DB init error:", e);
+  }
+
+  const port = process.env.PORT || 10000;
+  app.listen(port, () => {
+    console.log("Server running on port", port);
+    console.log("Primary URL:", SHOPIFY_APP_URL);
   });
+})();
