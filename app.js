@@ -1,3 +1,4 @@
+import '@shopify/shopify-api/adapters/node';
 require("dotenv").config();
 
 const express = require("express");
@@ -197,9 +198,11 @@ cron.schedule("*/2 * * * *", async () => {
 
 initDb()
   .then(() => {
-    const port = process.env.PORT || 3000;
-    app.listen(port, () => console.log("Server listening on", port));
-  })
+    const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
   .catch((e) => {
     console.error("DB init failed:", e);
     process.exit(1);
