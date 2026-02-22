@@ -1,20 +1,31 @@
 require("dotenv").config();
 
 let memory = {
-  tokens: new Map(), // shopDomain -> accessToken
-  processed: new Set(), // id evento
-  runs: [],
-  logs: []
+  tokens: new Map(),     // shopDomain -> accessToken
+  processed: new Set(),  // id evento
+  runs: [],              // fallback runs
+  runLogs: new Map()     // runId -> logs[]
 };
 
 let pg = null;
 let pool = null;
 
+// ---------- helpers ----------
+function nowIso() {
+  return new Date().toISOString();
+}
+function genId(prefix = "run") {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+// ---------- init ----------
 async function initDb() {
   const url = process.env.DATABASE_URL;
 
   if (!url) {
-    console.log("DATABASE_URL not set. Using in-memory fallback (NON consigliato in produzione).");
+    console.log(
+      "DATABASE_URL not set. Using in-memory fallback (NON consigliato in produzione)."
+    );
     return;
   }
 
@@ -24,10 +35,7 @@ async function initDb() {
     ssl: url.includes("localhost") ? false : { rejectUnauthorized: false }
   });
 
-  // =============================
-  // TABELLE BASE
-  // =============================
-
+  // 1) token shop
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shop_tokens (
       shop_domain TEXT PRIMARY KEY,
@@ -36,6 +44,7 @@ async function initDb() {
     );
   `);
 
+  // 2) idempotenza webhook/eventi
   await pool.query(`
     CREATE TABLE IF NOT EXISTS processed_events (
       id TEXT PRIMARY KEY,
@@ -43,52 +52,46 @@ async function initDb() {
     );
   `);
 
-  // =============================
-  // NUOVE TABELLE DASHBOARD
-  // =============================
-
+  // 3) RUNS (una riga = una sync)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sync_runs (
-      id BIGSERIAL PRIMARY KEY,
+      id TEXT PRIMARY KEY,
       shop_domain TEXT NOT NULL,
-      job_type TEXT NOT NULL,
-      status TEXT NOT NULL,
+      trigger TEXT NOT NULL,                 -- "manual" | "cron" | "webhook" | ecc
+      status TEXT NOT NULL DEFAULT 'running',-- "running" | "success" | "error"
       started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       finished_at TIMESTAMPTZ,
-      duration_ms INTEGER,
-      summary JSONB,
-      error TEXT
+      summary JSONB NOT NULL DEFAULT '{}'::jsonb
     );
   `);
 
+  // indice utile per dashboard
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_sync_runs_shop_time
+    CREATE INDEX IF NOT EXISTS idx_sync_runs_shop_started
     ON sync_runs (shop_domain, started_at DESC);
   `);
 
+  // 4) LOGS (righe di log collegate al run)
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_logs (
+    CREATE TABLE IF NOT EXISTS sync_run_logs (
       id BIGSERIAL PRIMARY KEY,
-      shop_domain TEXT,
-      level TEXT NOT NULL,
+      run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+      level TEXT NOT NULL DEFAULT 'info', -- "info" | "warn" | "error"
       message TEXT NOT NULL,
-      meta JSONB,
+      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
   await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_app_logs_time
-    ON app_logs (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_sync_run_logs_run_created
+    ON sync_run_logs (run_id, created_at ASC);
   `);
 
   console.log("DB ready (Postgres).");
 }
 
-// =============================
-// TOKEN SHOP
-// =============================
-
+// ---------- tokens ----------
 async function upsertShopToken(shopDomain, accessToken) {
   if (!pool) {
     memory.tokens.set(shopDomain, accessToken);
@@ -113,20 +116,15 @@ async function getShopToken(shopDomain) {
     `SELECT access_token FROM shop_tokens WHERE shop_domain = $1`,
     [shopDomain]
   );
-
   return r.rows[0]?.access_token || null;
 }
 
-// =============================
-// EVENTI PROCESSATI
-// =============================
-
+// ---------- processed events ----------
 async function markProcessed(id) {
   if (!pool) {
     memory.processed.add(id);
     return;
   }
-
   await pool.query(
     `INSERT INTO processed_events (id) VALUES ($1) ON CONFLICT DO NOTHING`,
     [id]
@@ -136,52 +134,72 @@ async function markProcessed(id) {
 async function isProcessed(id) {
   if (!pool) return memory.processed.has(id);
 
-  const r = await pool.query(
-    `SELECT 1 FROM processed_events WHERE id = $1`,
-    [id]
-  );
-
+  const r = await pool.query(`SELECT 1 FROM processed_events WHERE id = $1`, [
+    id
+  ]);
   return r.rowCount > 0;
 }
 
-// =============================
-// SYNC RUNS (DASHBOARD)
-// =============================
+// ---------- runs & logs (per dashboard) ----------
+async function createRun({ shopDomain, trigger = "manual", summary = {} }) {
+  const runId = genId("run");
 
-async function createRun(shopDomain, jobType) {
   if (!pool) {
     const run = {
-      id: Date.now(),
+      id: runId,
       shop_domain: shopDomain,
-      job_type: jobType,
+      trigger,
       status: "running",
-      started_at: new Date().toISOString()
+      started_at: nowIso(),
+      finished_at: null,
+      summary
     };
     memory.runs.unshift(run);
-    return run.id;
+    memory.runLogs.set(runId, []);
+    return runId;
   }
 
-  const r = await pool.query(
+  await pool.query(
     `
-    INSERT INTO sync_runs (shop_domain, job_type, status)
-    VALUES ($1, $2, 'running')
-    RETURNING id;
+    INSERT INTO sync_runs (id, shop_domain, trigger, status, summary)
+    VALUES ($1, $2, $3, 'running', $4::jsonb)
   `,
-    [shopDomain, jobType]
+    [runId, shopDomain, trigger, JSON.stringify(summary || {})]
   );
 
-  return r.rows[0].id;
+  return runId;
 }
 
-async function finishRun(id, status, durationMs, summary, error) {
+async function addRunLog(runId, { level = "info", message, meta = {} }) {
+  if (!message) return;
+
   if (!pool) {
-    const run = memory.runs.find(r => r.id === id);
+    if (!memory.runLogs.has(runId)) memory.runLogs.set(runId, []);
+    memory.runLogs.get(runId).push({
+      level,
+      message,
+      meta,
+      created_at: nowIso()
+    });
+    return;
+  }
+
+  await pool.query(
+    `
+    INSERT INTO sync_run_logs (run_id, level, message, meta)
+    VALUES ($1, $2, $3, $4::jsonb)
+  `,
+    [runId, level, message, JSON.stringify(meta || {})]
+  );
+}
+
+async function finishRun(runId, { status = "success", summary = {} } = {}) {
+  if (!pool) {
+    const run = memory.runs.find((r) => r.id === runId);
     if (run) {
       run.status = status;
-      run.finished_at = new Date().toISOString();
-      run.duration_ms = durationMs;
-      run.summary = summary;
-      run.error = error;
+      run.finished_at = nowIso();
+      run.summary = { ...(run.summary || {}), ...(summary || {}) };
     }
     return;
   }
@@ -189,111 +207,64 @@ async function finishRun(id, status, durationMs, summary, error) {
   await pool.query(
     `
     UPDATE sync_runs
-    SET status = $1,
+    SET status = $2,
         finished_at = NOW(),
-        duration_ms = $2,
-        summary = $3,
-        error = $4
-    WHERE id = $5;
+        summary = (summary || $3::jsonb)
+    WHERE id = $1
   `,
-    [status, durationMs, summary ? JSON.stringify(summary) : null, error, id]
+    [runId, status, JSON.stringify(summary || {})]
   );
 }
 
-async function listRuns(shopDomain, limit = 50) {
-  if (!pool) return memory.runs.slice(0, limit);
-
-  const r = await pool.query(
-    `
-    SELECT * FROM sync_runs
-    WHERE shop_domain = $1
-    ORDER BY started_at DESC
-    LIMIT $2;
-  `,
-    [shopDomain, limit]
-  );
-
-  return r.rows;
-}
-
-async function getLastRun(shopDomain) {
-  if (!pool) return memory.runs[0] || null;
-
-  const r = await pool.query(
-    `
-    SELECT * FROM sync_runs
-    WHERE shop_domain = $1
-    ORDER BY started_at DESC
-    LIMIT 1;
-  `,
-    [shopDomain]
-  );
-
-  return r.rows[0] || null;
-}
-
-// =============================
-// LOG SISTEMA
-// =============================
-
-async function logEvent(shopDomain, level, message, meta = null) {
+async function listRuns(shopDomain, limit = 20) {
   if (!pool) {
-    memory.logs.unshift({
-      shop_domain: shopDomain,
-      level,
-      message,
-      meta,
-      created_at: new Date().toISOString()
-    });
-    return;
-  }
-
-  await pool.query(
-    `
-    INSERT INTO app_logs (shop_domain, level, message, meta)
-    VALUES ($1, $2, $3, $4);
-  `,
-    [shopDomain, level, message, meta ? JSON.stringify(meta) : null]
-  );
-}
-
-async function listLogs(shopDomain, limit = 30) {
-  if (!pool) return memory.logs.slice(0, limit);
-
-  const r = await pool.query(
-    `
-    SELECT * FROM app_logs
-    WHERE shop_domain = $1
-    ORDER BY created_at DESC
-    LIMIT $2;
-  `,
-    [shopDomain, limit]
-  );
-
-  return r.rows;
-}
-
-async function countErrors24h(shopDomain) {
-  if (!pool) {
-    return memory.logs.filter(
-      l => l.shop_domain === shopDomain && l.level === "error"
-    ).length;
+    return memory.runs
+      .filter((r) => r.shop_domain === shopDomain)
+      .slice(0, limit);
   }
 
   const r = await pool.query(
     `
-    SELECT COUNT(*) FROM app_logs
+    SELECT id, shop_domain, trigger, status, started_at, finished_at, summary
+    FROM sync_runs
     WHERE shop_domain = $1
-      AND level = 'error'
-      AND created_at > NOW() - INTERVAL '24 hours';
+    ORDER BY started_at DESC
+    LIMIT $2
   `,
-    [shopDomain]
+    [shopDomain, limit]
   );
-
-  return parseInt(r.rows[0].count, 10);
+  return r.rows;
 }
 
-// =============================
+async function getRunWithLogs(runId, logLimit = 300) {
+  if (!pool) {
+    const run = memory.runs.find((r) => r.id === runId) || null;
+    const logs = (memory.runLogs.get(runId) || []).slice(-logLimit);
+    return { run, logs };
+  }
+
+  const runR = await pool.query(
+    `
+    SELECT id, shop_domain, trigger, status, started_at, finished_at, summary
+    FROM sync_runs
+    WHERE id = $1
+  `,
+    [runId]
+  );
+
+  const logsR = await pool.query(
+    `
+    SELECT level, message, meta, created_at
+    FROM sync_run_logs
+    WHERE run_id = $1
+    ORDER BY created_at ASC
+    LIMIT $2
+  `,
+    [runId, logLimit]
+  );
+
+  return { run: runR.rows[0] || null, logs: logsR.rows };
+}
 
 module.exports = {
   initDb,
@@ -301,11 +272,11 @@ module.exports = {
   getShopToken,
   markProcessed,
   isProcessed,
+
+  // dashboard
   createRun,
+  addRunLog,
   finishRun,
   listRuns,
-  getLastRun,
-  logEvent,
-  listLogs,
-  countErrors24h
+  getRunWithLogs
 };
