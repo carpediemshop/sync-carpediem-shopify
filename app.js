@@ -1,4 +1,4 @@
-import '@shopify/shopify-api/adapters/node';
+require("@shopify/shopify-api/adapters/node");
 require("dotenv").config();
 
 const express = require("express");
@@ -9,6 +9,7 @@ const { shopifyApi, LATEST_API_VERSION } = require("@shopify/shopify-api");
 const { initDb, upsertShopToken, getShopToken, markProcessed, isProcessed } = require("./db");
 
 const app = express();
+app.get("/health", (req, res) => res.status(200).send("ok"));
 app.use(bodyParser.json({ type: "application/json" }));
 
 const {
@@ -200,9 +201,10 @@ initDb()
   .then(() => {
     const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  })
   .catch((e) => {
     console.error("DB init failed:", e);
     process.exit(1);
