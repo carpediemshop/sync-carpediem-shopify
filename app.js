@@ -1,477 +1,274 @@
-require("@shopify/shopify-api/adapters/node");
-require("dotenv").config();
+import "dotenv/config";
+import express from "express";
+import cookieParser from "cookie-parser";
 
-const express = require("express");
-const bodyParser = require("body-parser");
-const crypto = require("crypto");
-
-const {
-  initDb,
-  upsertShopToken,
-  getShopToken,
-  createRun,
-  addRunLog,
-  finishRun,
-  listRuns,
-  getRunWithLogs,
-} = require("./db");
+import { shopify, shopifyRest, listProducts, getMainLocationId, getInventoryLevel, getProductById, getVariantById } from "./shopify.js";
+import { verifyShopifyWebhook } from "./verifyShopifyWebhook.js";
+import { upsertShopToken, getShopToken, upsertEbayLink, getEbayLinkBySku, listEbayLinks } from "./db.js";
+import { createOrReplaceInventoryItem, updateInventoryQuantity, createOffer, publishOffer, updateOfferPriceQty } from "./ebay.js";
 
 const app = express();
-app.set("trust proxy", 1);
+app.use(cookieParser());
 
-app.use(bodyParser.json({ limit: "2mb" }));
+// Webhook: raw body (serve per HMAC)
+app.use("/webhooks", express.raw({ type: "application/json" }));
+app.use(express.json());
 
-// ---------- ENV ----------
-const {
-  SHOPIFY_APP_URL,
-  SHOPIFY_CLIENT_ID,
-  SHOPIFY_CLIENT_SECRET,
-  SHOPIFY_WEBHOOK_SECRET,
-} = process.env;
+app.get("/", (req, res) => res.send("OK sync-carpediem-shopify"));
 
-if (!SHOPIFY_APP_URL || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
-  console.error("Missing env. Required: SHOPIFY_APP_URL, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET");
-}
-
-// Scopes
-const SCOPES = ["read_products", "write_inventory", "read_orders"].join(",");
-
-// ---------- helpers ----------
-function isValidShop(shop) {
-  return typeof shop === "string" && /^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$/.test(shop);
-}
-
-function timingSafeEqual(a, b) {
-  const aBuf = Buffer.from(a, "utf8");
-  const bBuf = Buffer.from(b, "utf8");
-  if (aBuf.length !== bBuf.length) return false;
-  return crypto.timingSafeEqual(aBuf, bBuf);
-}
-
-// ✅ HMAC OAUTH: usa querystring RAW (evita problemi di decoding)
-function verifyOAuthHmacFromRawUrl(req, secret) {
-  const url = req.originalUrl || "";
-  const qs = url.includes("?") ? url.split("?")[1] : "";
-  if (!qs) return false;
-
-  // prendi hmac dal raw
-  const parts = qs.split("&").filter(Boolean);
-  const hmacPart = parts.find((p) => p.startsWith("hmac="));
-  if (!hmacPart) return false;
-  const hmac = hmacPart.slice("hmac=".length);
-
-  // Shopify dice: costruisci message con TUTTI i params tranne hmac e signature, ordinati alfabeticamente
-  const filtered = parts.filter((p) => !p.startsWith("hmac=") && !p.startsWith("signature="));
-  filtered.sort(); // sort lessicografico raw key=value
-
-  const message = filtered.join("&");
-
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
-  return timingSafeEqual(digest, hmac);
-}
-
-function randomState() {
-  return crypto.randomBytes(16).toString("hex");
-}
-
-// Memoria per state OAuth
-const oauthStates = new Map(); // state -> { shop, host, createdAt }
-const STATE_TTL_MS = 10 * 60 * 1000;
-
-function putState(state, payload) {
-  oauthStates.set(state, { ...payload, createdAt: Date.now() });
-}
-function getState(state) {
-  const v = oauthStates.get(state);
-  if (!v) return null;
-  if (Date.now() - v.createdAt > STATE_TTL_MS) {
-    oauthStates.delete(state);
-    return null;
-  }
-  return v;
-}
-function delState(state) {
-  oauthStates.delete(state);
-}
-
-// CSP per embedded app in Shopify Admin
-function setShopifyCsp(req, res) {
+/** 1) INSTALL SHOPIFY */
+app.get("/auth", async (req, res) => {
   const shop = req.query.shop;
-  if (isValidShop(shop)) {
-    res.setHeader("Content-Security-Policy", `frame-ancestors https://${shop} https://admin.shopify.com;`);
-  } else {
-    res.setHeader("Content-Security-Policy", `frame-ancestors https://admin.shopify.com;`);
-  }
-  res.setHeader("X-Frame-Options", "ALLOWALL");
-}
+  if (!shop) return res.status(400).send("Missing shop");
 
-// ---------- 1) HEALTH ----------
-app.get("/health", (req, res) => res.status(200).send("ok"));
+  const redirectUrl = await shopify.auth.begin({
+    shop,
+    callbackPath: "/auth/callback",
+    isOnline: false,
+    rawRequest: req,
+    rawResponse: res
+  });
 
-// ---------- 2) WEBHOOK endpoint (opzionale) ----------
-app.post("/webhooks/shopify", bodyParser.raw({ type: "application/json" }), (req, res) => {
-  try {
-    if (!SHOPIFY_WEBHOOK_SECRET) return res.status(200).send("ok");
-
-    const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
-    const body = req.body; // Buffer
-    const digest = crypto.createHmac("sha256", SHOPIFY_WEBHOOK_SECRET).update(body).digest("base64");
-
-    if (!hmacHeader || !timingSafeEqual(digest, hmacHeader)) {
-      return res.status(401).send("invalid webhook hmac");
-    }
-
-    return res.status(200).send("ok");
-  } catch (e) {
-    console.error("Webhook error:", e);
-    return res.status(500).send("error");
-  }
+  return res.redirect(redirectUrl);
 });
 
-// ---------- 3) OAUTH START ----------
-app.get("/auth", (req, res) => {
-  try {
-    const shop = req.query.shop;
-    const host = req.query.host;
-
-    if (!isValidShop(shop)) return res.status(400).send("Invalid or missing shop parameter");
-
-    const state = randomState();
-    putState(state, { shop, host: host || "" });
-
-    const redirectUri = `${SHOPIFY_APP_URL}/auth/callback`;
-
-    const installUrl =
-      `https://${shop}/admin/oauth/authorize` +
-      `?client_id=${encodeURIComponent(SHOPIFY_CLIENT_ID)}` +
-      `&scope=${encodeURIComponent(SCOPES)}` +
-      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-      `&state=${encodeURIComponent(state)}`;
-
-    return res.redirect(installUrl);
-  } catch (e) {
-    console.error("/auth error:", e);
-    return res.status(500).send("Auth start error");
-  }
-});
-
-// ---------- 4) OAUTH CALLBACK ----------
+/** 2) CALLBACK */
 app.get("/auth/callback", async (req, res) => {
-  try {
-    const { shop, code, state } = req.query;
+  const { session } = await shopify.auth.callback({
+    rawRequest: req,
+    rawResponse: res
+  });
 
-    if (!isValidShop(shop)) return res.status(400).send("Invalid shop");
-    if (!code || !state) return res.status(400).send("Missing code/state");
+  await upsertShopToken({
+    shop: session.shop,
+    accessToken: session.accessToken,
+    scope: session.scope
+  });
 
-    const st = getState(state);
-    if (!st || st.shop !== shop) return res.status(400).send("Invalid/expired state");
+  await registerWebhooks(session.shop, session.accessToken);
 
-    // ✅ HMAC check (RAW)
-    const okHmac = verifyOAuthHmacFromRawUrl(req, SHOPIFY_CLIENT_SECRET);
-    if (!okHmac) {
-      console.error("HMAC validation failed. Check SHOPIFY_CLIENT_SECRET and raw query handling.");
-      return res.status(400).send("HMAC validation failed");
-    }
-
-    // Exchange code -> access_token
-    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code,
-      }),
-    });
-
-    if (!tokenResp.ok) {
-      const txt = await tokenResp.text().catch(() => "");
-      console.error("Token exchange failed:", tokenResp.status, txt);
-      return res.status(500).send("Token exchange failed");
-    }
-
-    const data = await tokenResp.json();
-    const accessToken = data.access_token;
-    if (!accessToken) return res.status(500).send("Missing access token");
-
-    await upsertShopToken(shop, accessToken);
-    delState(state);
-
-    return res.redirect(`${SHOPIFY_APP_URL}/app?shop=${encodeURIComponent(shop)}`);
-  } catch (e) {
-    console.error("/auth/callback error:", e);
-    return res.status(500).send("Auth callback error");
-  }
+  res.redirect(`/app?shop=${encodeURIComponent(session.shop)}`);
 });
 
-// ---------- DASHBOARD UI ----------
+/** Registra webhooks */
+async function registerWebhooks(shop, accessToken) {
+  const base = process.env.SHOPIFY_APP_URL;
+  const hooks = [
+    { topic: "products/update", address: `${base}/webhooks/products-update` }
+  ];
+
+  for (const h of hooks) {
+    try {
+      await shopifyRest({
+        shop,
+        accessToken,
+        method: "POST",
+        path: "/webhooks.json",
+        body: { webhook: { topic: h.topic, address: h.address, format: "json" } }
+      });
+    } catch (e) {
+      console.log("Webhook register:", h.topic, String(e.message));
+    }
+  }
+}
+
+/** 3) MINI UI (pagina semplice) */
 app.get("/app", async (req, res) => {
-  try {
-    setShopifyCsp(req, res);
+  const shop = req.query.shop;
+  if (!shop) return res.status(400).send("Missing shop");
 
-    const shop = req.query.shop;
-    if (!isValidShop(shop)) return res.status(400).send("Missing/invalid shop");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+    <html>
+      <head><meta charset="utf-8"><title>Sync eBay</title></head>
+      <body style="font-family: Arial; padding: 16px;">
+        <h2>Sync eBay - ${shop}</h2>
+        <p>1) <b>Lista prodotti Shopify</b> con pulsante Publish</p>
+        <a href="/app/products?shop=${encodeURIComponent(shop)}">Apri lista prodotti</a>
 
-    const token = await getShopToken(shop);
-    if (!token) {
-      return res
-        .status(401)
-        .send(`App non installata o token mancante per ${shop}. Reinstalla: ${SHOPIFY_APP_URL}/auth?shop=${encodeURIComponent(shop)}`);
-    }
+        <p style="margin-top:20px;">2) <b>Link DB</b> (debug)</p>
+        <a href="/api/links?shop=${encodeURIComponent(shop)}" target="_blank">Vedi JSON links</a>
+      </body>
+    </html>
+  `);
+});
 
-    return res.status(200).send(`<!doctype html>
-<html lang="it">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Syncro Amazon-Ebay</title>
-  <style>
-    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#f6f6f7}
-    .wrap{max-width:1100px;margin:24px auto;padding:0 16px}
-    .top{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:14px}
-    .card{background:#fff;border:1px solid #e3e3e3;border-radius:12px;padding:14px}
-    .grid{display:grid;grid-template-columns:1.2fr 1fr;gap:12px}
-    .btn{border:1px solid #111;background:#111;color:#fff;border-radius:10px;padding:10px 12px;cursor:pointer}
-    .btn2{border:1px solid #c9c9c9;background:#fff;color:#111;border-radius:10px;padding:10px 12px;cursor:pointer}
-    .muted{color:#666;font-size:13px}
-    table{width:100%;border-collapse:collapse}
-    th,td{padding:10px;border-bottom:1px solid #eee;font-size:14px;text-align:left}
-    tr:hover{background:#fafafa;cursor:pointer}
-    .pill{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;border:1px solid #ddd}
-    .ok{border-color:#b7eb8f;background:#f6ffed}
-    .err{border-color:#ffccc7;background:#fff2f0}
-    .run{border-color:#d6e4ff;background:#f0f5ff}
-    pre{white-space:pre-wrap;background:#0b1020;color:#d7e1ff;border-radius:10px;padding:12px;max-height:420px;overflow:auto}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-    .right{display:flex;gap:10px;align-items:center}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div>
-        <div style="font-size:18px;font-weight:700">Syncro Amazon-Ebay</div>
-        <div class="muted">Shop: <b>${shop}</b></div>
-      </div>
-      <div class="right">
-        <button class="btn2" id="refreshBtn">Aggiorna</button>
-        <button class="btn" id="syncBtn">Sync now</button>
-      </div>
-    </div>
+/** Lista prodotti Shopify con bottone Publish */
+app.get("/app/products", async (req, res) => {
+  const shop = req.query.shop;
+  if (!shop) return res.status(400).send("Missing shop");
 
-    <div class="grid">
-      <div class="card">
-        <div class="row" style="justify-content:space-between">
-          <div style="font-weight:700">Runs</div>
-          <div class="muted" id="runsInfo">—</div>
-        </div>
-        <div style="margin-top:10px;overflow:auto">
-          <table>
-            <thead>
-              <tr>
-                <th>Quando</th>
-                <th>Trigger</th>
-                <th>Stato</th>
-              </tr>
-            </thead>
-            <tbody id="runsTbody">
-              <tr><td colspan="3" class="muted">Caricamento…</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
+  const accessToken = await getShopToken(shop);
+  if (!accessToken) return res.status(401).send("App non installata su questo shop. Installa: /auth?shop=...");
 
-      <div class="card">
-        <div class="row" style="justify-content:space-between">
-          <div style="font-weight:700">Logs</div>
-          <div class="muted" id="logsInfo">Seleziona un run</div>
-        </div>
-        <div style="margin-top:10px">
-          <pre id="logsPre">—</pre>
-        </div>
-      </div>
-    </div>
+  const products = await listProducts(shop, accessToken, 50);
 
-    <div class="card" style="margin-top:12px">
-      <div style="font-weight:700;margin-bottom:6px">Azioni rapide</div>
-      <div class="muted">
-        • Apri dashboard: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
-        • Reinstall: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
-      </div>
-    </div>
-  </div>
-
-<script>
-const SHOP = ${JSON.stringify(shop)};
-const API = {
-  runs: (shop) => \`/api/runs?shop=\${encodeURIComponent(shop)}\`,
-  run: (id, shop) => \`/api/run/\${encodeURIComponent(id)}?shop=\${encodeURIComponent(shop)}\`,
-  sync: () => \`/api/sync/run\`
-};
-
-function pill(status){
-  const s = (status||"").toLowerCase();
-  const cls = s==="success" ? "pill ok" : (s==="error" ? "pill err" : "pill run");
-  return \`<span class="\${cls}">\${status}</span>\`;
-}
-function fmt(ts){
-  try { return new Date(ts).toLocaleString(); } catch(e){ return ts; }
-}
-
-async function loadRuns(){
-  const r = await fetch(API.runs(SHOP));
-  const data = await r.json();
-  const tbody = document.getElementById("runsTbody");
-  document.getElementById("runsInfo").textContent = (data.runs?.length||0) + " runs";
-  if(!data.runs || data.runs.length===0){
-    tbody.innerHTML = '<tr><td colspan="3" class="muted">Nessun run ancora. Premi “Sync now”.</td></tr>';
-    return;
+  // tabella semplice: solo prima variante per prodotto (poi la estendiamo a tutte)
+  let rows = "";
+  for (const p of products) {
+    const v = (p.variants || [])[0];
+    if (!v) continue;
+    rows += `
+      <tr>
+        <td>${p.title}</td>
+        <td>${v.sku || ""}</td>
+        <td>${v.price}</td>
+        <td><button onclick="publish(${p.id}, ${v.id})">Pubblica su eBay</button></td>
+        <td id="st_${v.id}"></td>
+      </tr>
+    `;
   }
-  tbody.innerHTML = data.runs.map(x => \`
-    <tr data-runid="\${x.id}">
-      <td>\${fmt(x.started_at)}</td>
-      <td>\${x.trigger}</td>
-      <td>\${pill(x.status)}</td>
-    </tr>\`
-  ).join("");
-  [...tbody.querySelectorAll("tr[data-runid]")].forEach(tr=>{
-    tr.addEventListener("click", ()=> loadRun(tr.dataset.runid));
-  });
-}
 
-async function loadRun(runId){
-  document.getElementById("logsInfo").textContent = "Caricamento logs…";
-  const r = await fetch(API.run(runId, SHOP));
-  const data = await r.json();
-  const lines = [];
-  lines.push("RUN: " + (data.run?.id || runId));
-  lines.push("STATUS: " + (data.run?.status || "—"));
-  lines.push("TRIGGER: " + (data.run?.trigger || "—"));
-  lines.push("START: " + (data.run?.started_at ? fmt(data.run.started_at) : "—"));
-  lines.push("END: " + (data.run?.finished_at ? fmt(data.run.finished_at) : "—"));
-  lines.push("");
-  lines.push("---- LOGS ----");
-  (data.logs||[]).forEach(l=>{
-    lines.push(\`[\${fmt(l.created_at)}] \${(l.level||"info").toUpperCase()}: \${l.message}\`);
-  });
-  document.getElementById("logsPre").textContent = lines.join("\\n");
-  document.getElementById("logsInfo").textContent = "Run selezionato: " + runId;
-}
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Prodotti Shopify</title>
+        <style>
+          table{border-collapse:collapse;width:100%;}
+          th,td{border:1px solid #ddd;padding:8px;font-size:14px;}
+          th{background:#f5f5f5;}
+          button{padding:6px 10px;cursor:pointer;}
+        </style>
+      </head>
+      <body style="font-family: Arial; padding: 16px;">
+        <h2>Prodotti Shopify (50) - ${shop}</h2>
+        <table>
+          <thead>
+            <tr><th>Titolo</th><th>SKU</th><th>Prezzo</th><th>Azione</th><th>Stato</th></tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
 
-async function syncNow(){
-  document.getElementById("syncBtn").disabled = true;
-  document.getElementById("syncBtn").textContent = "Sync in corso…";
-  try{
-    const r = await fetch(API.sync(), {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ shop: SHOP, trigger: "manual" })
+        <script>
+          const SHOP = ${JSON.stringify(shop)};
+
+          async function publish(productId, variantId){
+            const st = document.getElementById("st_" + variantId);
+            st.innerText = "Pubblicazione in corso...";
+            try{
+              const res = await fetch("/api/ebay/publish", {
+                method:"POST",
+                headers:{"Content-Type":"application/json"},
+                body: JSON.stringify({ shop: SHOP, productId, variantId })
+              });
+              const data = await res.json();
+              if(!res.ok) throw new Error(data.error || "Errore");
+              st.innerText = "OK ✅ listingId=" + (data.listingId || "");
+            }catch(e){
+              st.innerText = "ERRORE ❌ " + e.message;
+            }
+          }
+        </script>
+      </body>
+    </html>
+  `);
+});
+
+/** Debug: lista links nel DB */
+app.get("/api/links", async (req, res) => {
+  const shop = req.query.shop;
+  if (!shop) return res.status(400).json({ error: "Missing shop" });
+
+  const token = await getShopToken(shop);
+  if (!token) return res.status(401).json({ error: "App non installata su questo shop" });
+
+  const rows = await listEbayLinks(shop, 200);
+  res.json({ rows });
+});
+
+/** 4) PUBBLICA SU EBAY (chiamato dal bottone) */
+app.post("/api/ebay/publish", async (req, res) => {
+  const { shop, productId, variantId } = req.body || {};
+  if (!shop || !productId || !variantId) return res.status(400).json({ error: "Missing shop/productId/variantId" });
+
+  const accessToken = await getShopToken(shop);
+  if (!accessToken) return res.status(401).json({ error: "App non installata su questo shop" });
+
+  try {
+    const product = await getProductById(shop, accessToken, productId);
+    const variant = await getVariantById(shop, accessToken, variantId);
+
+    const sku = variant?.sku;
+    if (!sku) throw new Error("SKU mancante sulla variante Shopify");
+
+    const locationId = await getMainLocationId(shop, accessToken);
+    const qty = await getInventoryLevel(shop, accessToken, variant.inventory_item_id, locationId);
+    const price = Number(variant.price);
+
+    const title = product.title;
+    const description = (product.body_html || "").replace(/<[^>]+>/g, " ").trim().slice(0, 4000);
+    const images = (product.images || []).map(i => i.src).filter(Boolean);
+
+    // salva mapping base
+    await upsertEbayLink({
+      shop,
+      shopifyProductId: product.id,
+      shopifyVariantId: variant.id,
+      sku,
+      status: "linked"
     });
-    const data = await r.json();
-    await loadRuns();
-    if(data.runId) await loadRun(data.runId);
-  } finally {
-    document.getElementById("syncBtn").disabled = false;
-    document.getElementById("syncBtn").textContent = "Sync now";
-  }
-}
 
-document.getElementById("refreshBtn").addEventListener("click", loadRuns);
-document.getElementById("syncBtn").addEventListener("click", syncNow);
-loadRuns();
-</script>
-</body>
-</html>`);
+    // crea inventory item
+    await createOrReplaceInventoryItem({ sku, title, description, images });
+
+    // set qty
+    await updateInventoryQuantity({ sku, quantity: qty });
+
+    // create offer + publish
+    const offerId = await createOffer({ sku, price, quantity: qty });
+    const listingId = await publishOffer(offerId);
+
+    await upsertEbayLink({
+      shop,
+      shopifyProductId: product.id,
+      shopifyVariantId: variant.id,
+      sku,
+      ebayOfferId: offerId,
+      ebayListingId: listingId,
+      status: "published"
+    });
+
+    res.json({ ok: true, sku, offerId, listingId });
   } catch (e) {
-    console.error("/app error:", e);
-    return res.status(500).send("Dashboard error");
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// ---------- API: runs ----------
-app.get("/api/runs", async (req, res) => {
-  try {
-    const shop = req.query.shop;
-    if (!isValidShop(shop)) return res.status(400).json({ error: "invalid shop" });
+/** 5) WEBHOOK: quando cambia prodotto (prezzo o altro) → aggiorna eBay */
+app.post("/webhooks/products-update", async (req, res) => {
+  req.rawBody = req.body;
+  if (!verifyShopifyWebhook(req)) return res.status(401).send("Invalid HMAC");
 
-    const token = await getShopToken(shop);
-    if (!token) return res.status(401).json({ error: "not installed" });
+  const shop = req.get("X-Shopify-Shop-Domain");
+  const accessToken = await getShopToken(shop);
+  if (!accessToken) return res.status(200).send("No token (ignored)");
 
-    const runs = await listRuns(shop, 30);
-    return res.json({ runs });
-  } catch (e) {
-    console.error("/api/runs error:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
+  const payload = JSON.parse(req.body.toString("utf8"));
+  const variants = payload.variants || [];
 
-// ---------- API: single run + logs ----------
-app.get("/api/run/:id", async (req, res) => {
-  try {
-    const shop = req.query.shop;
-    const runId = req.params.id;
-    if (!isValidShop(shop)) return res.status(400).json({ error: "invalid shop" });
+  for (const v of variants) {
+    const sku = v.sku;
+    if (!sku) continue;
 
-    const token = await getShopToken(shop);
-    if (!token) return res.status(401).json({ error: "not installed" });
+    const link = await getEbayLinkBySku(shop, sku);
+    if (!link?.ebay_offer_id) continue;
 
-    const data = await getRunWithLogs(runId, 400);
+    try {
+      const locationId = await getMainLocationId(shop, accessToken);
+      const qty = await getInventoryLevel(shop, accessToken, v.inventory_item_id, locationId);
+      const price = Number(v.price);
 
-    if (data.run && data.run.shop_domain && data.run.shop_domain !== shop) {
-      return res.status(403).json({ error: "forbidden" });
+      await updateOfferPriceQty({ offerId: link.ebay_offer_id, price, quantity: qty });
+    } catch (e) {
+      console.error("eBay update failed:", sku, String(e.message));
     }
-
-    return res.json({ run: data.run, logs: data.logs });
-  } catch (e) {
-    console.error("/api/run/:id error:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// ---------- API: start sync (DEMO) ----------
-app.post("/api/sync/run", async (req, res) => {
-  try {
-    const { shop, trigger = "manual" } = req.body || {};
-    if (!isValidShop(shop)) return res.status(400).json({ error: "invalid shop" });
-
-    const token = await getShopToken(shop);
-    if (!token) return res.status(401).json({ error: "not installed" });
-
-    const runId = await createRun({ shopDomain: shop, trigger, summary: { mode: "demo" } });
-    await addRunLog(runId, { level: "info", message: "Sync avviata (demo)." });
-    await addRunLog(runId, { level: "info", message: "Controllo token Shopify: OK" });
-    await addRunLog(runId, { level: "info", message: "Step 1/3: lettura dati… (demo)" });
-    await addRunLog(runId, { level: "info", message: "Step 2/3: confronto… (demo)" });
-    await addRunLog(runId, { level: "info", message: "Step 3/3: aggiornamento… (demo)" });
-
-    await finishRun(runId, { status: "success", summary: { done: true, note: "Demo sync completed" } });
-    await addRunLog(runId, { level: "info", message: "Sync completata con successo (demo)." });
-
-    return res.json({ ok: true, runId });
-  } catch (e) {
-    console.error("/api/sync/run error:", e);
-    return res.status(500).json({ error: "server error" });
-  }
-});
-
-// ---------- Root ----------
-app.get("/", (req, res) => {
-  res.status(200).send(
-    "Sync CarpeDiem - server online. Usa /auth?shop=IL_TUO_SHOP.myshopify.com per installare. Dashboard: /app?shop=IL_TUO_SHOP.myshopify.com"
-  );
-});
-
-// ---------- Start ----------
-(async () => {
-  try {
-    await initDb();
-  } catch (e) {
-    console.error("DB init error:", e);
   }
 
-  const port = process.env.PORT || 10000;
-  app.listen(port, () => {
-    console.log("Server running on port", port);
-    console.log("Primary URL:", SHOPIFY_APP_URL);
-  });
-})();
+  res.status(200).send("OK");
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log("Server listening on", port));
