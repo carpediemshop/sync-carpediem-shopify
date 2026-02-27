@@ -21,13 +21,19 @@ app.get("/auth", async (req, res) => {
   const shop = req.query.shop;
   if (!shop) return res.status(400).send("Missing shop");
 
-  const redirectUrl = await shopify.auth.begin({
+  // IMPORTANTE: non fare res.redirect() dopo,
+  // perché con rawResponse l'SDK può già scrivere la risposta.
+  await shopify.auth.begin({
     shop,
     callbackPath: "/auth/callback",
     isOnline: false,
     rawRequest: req,
-    rawResponse: res
+    rawResponse: res,
   });
+
+  // stop: la risposta è già gestita da begin()
+  return;
+});
 
   return res.redirect(redirectUrl);
 });
