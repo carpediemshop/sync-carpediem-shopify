@@ -19,7 +19,6 @@ const {
 const app = express();
 app.set("trust proxy", 1);
 
-// JSON per API
 app.use(bodyParser.json({ limit: "2mb" }));
 
 // ---------- ENV ----------
@@ -43,21 +42,29 @@ function isValidShop(shop) {
 }
 
 function timingSafeEqual(a, b) {
-  const aBuf = Buffer.from(a || "", "utf8");
-  const bBuf = Buffer.from(b || "", "utf8");
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
   if (aBuf.length !== bBuf.length) return false;
   return crypto.timingSafeEqual(aBuf, bBuf);
 }
 
-// Shopify OAuth HMAC verification (querystring)
-function verifyOAuthHmac(query, secret) {
-  const { hmac, signature, ...rest } = query;
-  if (!hmac) return false;
+// ✅ HMAC OAUTH: usa querystring RAW (evita problemi di decoding)
+function verifyOAuthHmacFromRawUrl(req, secret) {
+  const url = req.originalUrl || "";
+  const qs = url.includes("?") ? url.split("?")[1] : "";
+  if (!qs) return false;
 
-  const message = Object.keys(rest)
-    .sort()
-    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
-    .join("&");
+  // prendi hmac dal raw
+  const parts = qs.split("&").filter(Boolean);
+  const hmacPart = parts.find((p) => p.startsWith("hmac="));
+  if (!hmacPart) return false;
+  const hmac = hmacPart.slice("hmac=".length);
+
+  // Shopify dice: costruisci message con TUTTI i params tranne hmac e signature, ordinati alfabeticamente
+  const filtered = parts.filter((p) => !p.startsWith("hmac=") && !p.startsWith("signature="));
+  filtered.sort(); // sort lessicografico raw key=value
+
+  const message = filtered.join("&");
 
   const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
   return timingSafeEqual(digest, hmac);
@@ -67,7 +74,7 @@ function randomState() {
   return crypto.randomBytes(16).toString("hex");
 }
 
-// Memoria per state OAuth (ok per ora; in produzione meglio DB/Redis)
+// Memoria per state OAuth
 const oauthStates = new Map(); // state -> { shop, host, createdAt }
 const STATE_TTL_MS = 10 * 60 * 1000;
 
@@ -91,10 +98,7 @@ function delState(state) {
 function setShopifyCsp(req, res) {
   const shop = req.query.shop;
   if (isValidShop(shop)) {
-    res.setHeader(
-      "Content-Security-Policy",
-      `frame-ancestors https://${shop} https://admin.shopify.com;`
-    );
+    res.setHeader("Content-Security-Policy", `frame-ancestors https://${shop} https://admin.shopify.com;`);
   } else {
     res.setHeader("Content-Security-Policy", `frame-ancestors https://admin.shopify.com;`);
   }
@@ -129,6 +133,7 @@ app.get("/auth", (req, res) => {
   try {
     const shop = req.query.shop;
     const host = req.query.host;
+
     if (!isValidShop(shop)) return res.status(400).send("Invalid or missing shop parameter");
 
     const state = randomState();
@@ -161,9 +166,14 @@ app.get("/auth/callback", async (req, res) => {
     const st = getState(state);
     if (!st || st.shop !== shop) return res.status(400).send("Invalid/expired state");
 
-    const okHmac = verifyOAuthHmac(req.query, SHOPIFY_CLIENT_SECRET);
-    if (!okHmac) return res.status(400).send("HMAC validation failed");
+    // ✅ HMAC check (RAW)
+    const okHmac = verifyOAuthHmacFromRawUrl(req, SHOPIFY_CLIENT_SECRET);
+    if (!okHmac) {
+      console.error("HMAC validation failed. Check SHOPIFY_CLIENT_SECRET and raw query handling.");
+      return res.status(400).send("HMAC validation failed");
+    }
 
+    // Exchange code -> access_token
     const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -187,7 +197,6 @@ app.get("/auth/callback", async (req, res) => {
     await upsertShopToken(shop, accessToken);
     delState(state);
 
-    // redirect dashboard
     return res.redirect(`${SHOPIFY_APP_URL}/app?shop=${encodeURIComponent(shop)}`);
   } catch (e) {
     console.error("/auth/callback error:", e);
@@ -207,11 +216,7 @@ app.get("/app", async (req, res) => {
     if (!token) {
       return res
         .status(401)
-        .send(
-          `App non installata o token mancante per ${shop}. Reinstalla: ${SHOPIFY_APP_URL}/auth?shop=${encodeURIComponent(
-            shop
-          )}`
-        );
+        .send(`App non installata o token mancante per ${shop}. Reinstalla: ${SHOPIFY_APP_URL}/auth?shop=${encodeURIComponent(shop)}`);
     }
 
     return res.status(200).send(`<!doctype html>
@@ -290,8 +295,8 @@ app.get("/app", async (req, res) => {
     <div class="card" style="margin-top:12px">
       <div style="font-weight:700;margin-bottom:6px">Azioni rapide</div>
       <div class="muted">
-        • Dashboard diretta: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
-        • Reinstall token: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
+        • Apri dashboard: <b>${SHOPIFY_APP_URL}/app?shop=${shop}</b><br/>
+        • Reinstall: <b>${SHOPIFY_APP_URL}/auth?shop=${shop}</b>
       </div>
     </div>
   </div>
@@ -309,7 +314,6 @@ function pill(status){
   const cls = s==="success" ? "pill ok" : (s==="error" ? "pill err" : "pill run");
   return \`<span class="\${cls}">\${status}</span>\`;
 }
-
 function fmt(ts){
   try { return new Date(ts).toLocaleString(); } catch(e){ return ts; }
 }
@@ -412,6 +416,7 @@ app.get("/api/run/:id", async (req, res) => {
     if (!token) return res.status(401).json({ error: "not installed" });
 
     const data = await getRunWithLogs(runId, 400);
+
     if (data.run && data.run.shop_domain && data.run.shop_domain !== shop) {
       return res.status(403).json({ error: "forbidden" });
     }
@@ -452,9 +457,7 @@ app.post("/api/sync/run", async (req, res) => {
 // ---------- Root ----------
 app.get("/", (req, res) => {
   res.status(200).send(
-    `Sync CarpeDiem - server online.
-Esempio install: ${SHOPIFY_APP_URL}/auth?shop=e9d9c4-38.myshopify.com
-Esempio dashboard: ${SHOPIFY_APP_URL}/app?shop=e9d9c4-38.myshopify.com`
+    "Sync CarpeDiem - server online. Usa /auth?shop=IL_TUO_SHOP.myshopify.com per installare. Dashboard: /app?shop=IL_TUO_SHOP.myshopify.com"
   );
 });
 
