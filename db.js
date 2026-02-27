@@ -1,265 +1,84 @@
-require("dotenv").config();
+import pg from "pg";
+const { Pool } = pg;
 
-let memory = {
-  tokens: new Map(), // shopDomain -> accessToken
-  processed: new Set(), // id evento
-  runs: [], // fallback runs
-  runLogs: new Map(), // runId -> logs[]
-};
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : undefined
+});
 
-let pg = null;
-let pool = null;
-
-function hasDb() {
-  return !!pool;
-}
-
-async function initDb() {
-  const url = process.env.DATABASE_URL;
-
-  if (!url) {
-    console.log("DATABASE_URL not set. Using in-memory fallback (NON consigliato in produzione).");
-    return;
-  }
-
-  pg = require("pg");
-  pool = new pg.Pool({
-    connectionString: url,
-    ssl: url.includes("localhost") ? false : { rejectUnauthorized: false },
-  });
-
-  // --- tokens ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS shop_tokens (
-      shop_domain TEXT PRIMARY KEY,
-      access_token TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  // --- processed events ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS processed_events (
-      id TEXT PRIMARY KEY,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  // --- runs (ID TEXT = uuid) ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS runs (
-      id TEXT PRIMARY KEY,
-      shop_domain TEXT NOT NULL,
-      trigger TEXT NOT NULL DEFAULT 'manual',
-      status TEXT NOT NULL DEFAULT 'running',
-      summary JSONB NOT NULL DEFAULT '{}'::jsonb,
-      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      finished_at TIMESTAMPTZ
-    );
-  `);
-
-  // --- run logs ---
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS run_logs (
-      id BIGSERIAL PRIMARY KEY,
-      run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-      level TEXT NOT NULL DEFAULT 'info',
-      message TEXT NOT NULL,
-      meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  // indici utili
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_runs_shop_started ON runs(shop_domain, started_at DESC);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_run_logs_run_created ON run_logs(run_id, created_at ASC);`);
-
-  console.log("DB ready (Postgres).");
-}
-
-// -------------------- TOKENS --------------------
-async function upsertShopToken(shopDomain, accessToken) {
-  if (!hasDb()) {
-    memory.tokens.set(shopDomain, accessToken);
-    return;
-  }
-
+export async function upsertShopToken({ shop, accessToken, scope }) {
   await pool.query(
     `
-    INSERT INTO shop_tokens (shop_domain, access_token, updated_at)
-    VALUES ($1, $2, NOW())
-    ON CONFLICT (shop_domain)
-    DO UPDATE SET access_token = EXCLUDED.access_token, updated_at = NOW();
-  `,
-    [shopDomain, accessToken]
+    INSERT INTO shops(shop, access_token, scope)
+    VALUES($1,$2,$3)
+    ON CONFLICT (shop)
+    DO UPDATE SET access_token=EXCLUDED.access_token, scope=EXCLUDED.scope, installed_at=now()
+    `,
+    [shop, accessToken, scope || null]
   );
 }
 
-async function getShopToken(shopDomain) {
-  if (!hasDb()) return memory.tokens.get(shopDomain) || null;
-
-  const r = await pool.query(`SELECT access_token FROM shop_tokens WHERE shop_domain = $1`, [shopDomain]);
+export async function getShopToken(shop) {
+  const r = await pool.query(`SELECT access_token FROM shops WHERE shop=$1`, [shop]);
   return r.rows[0]?.access_token || null;
 }
 
-// -------------------- PROCESSED EVENTS --------------------
-async function markProcessed(id) {
-  if (!hasDb()) {
-    memory.processed.add(id);
-    return;
-  }
-  await pool.query(`INSERT INTO processed_events (id) VALUES ($1) ON CONFLICT DO NOTHING`, [id]);
-}
-
-async function isProcessed(id) {
-  if (!hasDb()) return memory.processed.has(id);
-
-  const r = await pool.query(`SELECT 1 FROM processed_events WHERE id = $1`, [id]);
-  return r.rowCount > 0;
-}
-
-// -------------------- RUNS & LOGS --------------------
-function uuid() {
-  // Node 18+: crypto.randomUUID()
-  const crypto = require("crypto");
-  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
-}
-
-async function createRun({ shopDomain, trigger = "manual", summary = {} }) {
-  const runId = uuid();
-
-  if (!hasDb()) {
-    const run = {
-      id: runId,
-      shop_domain: shopDomain,
-      trigger,
-      status: "running",
-      summary,
-      started_at: new Date().toISOString(),
-      finished_at: null,
-    };
-    memory.runs.unshift(run);
-    memory.runLogs.set(runId, []);
-    return runId;
-  }
-
+export async function upsertEbayLink({
+  shop,
+  shopifyProductId,
+  shopifyVariantId,
+  sku,
+  ebayOfferId,
+  ebayListingId,
+  status,
+  lastError
+}) {
   await pool.query(
     `
-    INSERT INTO runs (id, shop_domain, trigger, status, summary, started_at)
-    VALUES ($1, $2, $3, 'running', $4::jsonb, NOW())
-  `,
-    [runId, shopDomain, trigger, JSON.stringify(summary || {})]
-  );
-
-  return runId;
-}
-
-async function addRunLog(runId, { level = "info", message, meta = {} }) {
-  if (!message) return;
-
-  if (!hasDb()) {
-    const arr = memory.runLogs.get(runId) || [];
-    arr.push({
-      run_id: runId,
-      level,
-      message,
-      meta,
-      created_at: new Date().toISOString(),
-    });
-    memory.runLogs.set(runId, arr);
-    return;
-  }
-
-  await pool.query(
-    `
-    INSERT INTO run_logs (run_id, level, message, meta, created_at)
-    VALUES ($1, $2, $3, $4::jsonb, NOW())
-  `,
-    [runId, level, message, JSON.stringify(meta || {})]
+    INSERT INTO ebay_links(shop, shopify_product_id, shopify_variant_id, sku, ebay_offer_id, ebay_listing_id, status, last_error)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+    ON CONFLICT (shop, sku)
+    DO UPDATE SET
+      shopify_product_id=EXCLUDED.shopify_product_id,
+      shopify_variant_id=EXCLUDED.shopify_variant_id,
+      ebay_offer_id=COALESCE(EXCLUDED.ebay_offer_id, ebay_links.ebay_offer_id),
+      ebay_listing_id=COALESCE(EXCLUDED.ebay_listing_id, ebay_links.ebay_listing_id),
+      status=COALESCE(EXCLUDED.status, ebay_links.status),
+      last_error=EXCLUDED.last_error
+    `,
+    [
+      shop,
+      shopifyProductId,
+      shopifyVariantId,
+      sku,
+      ebayOfferId || null,
+      ebayListingId || null,
+      status || "linked",
+      lastError || null
+    ]
   );
 }
 
-async function finishRun(runId, { status = "success", summary = {} }) {
-  if (!hasDb()) {
-    const run = memory.runs.find((r) => r.id === runId);
-    if (run) {
-      run.status = status;
-      run.summary = summary || {};
-      run.finished_at = new Date().toISOString();
-    }
-    return;
-  }
-
-  await pool.query(
-    `
-    UPDATE runs
-    SET status = $2,
-        summary = $3::jsonb,
-        finished_at = NOW()
-    WHERE id = $1
-  `,
-    [runId, status, JSON.stringify(summary || {})]
+export async function getEbayLinkBySku(shop, sku) {
+  const r = await pool.query(
+    `SELECT * FROM ebay_links WHERE shop=$1 AND sku=$2 LIMIT 1`,
+    [shop, sku]
   );
+  return r.rows[0] || null;
 }
 
-async function listRuns(shopDomain, limit = 30) {
-  if (!hasDb()) {
-    return (memory.runs || []).filter((r) => r.shop_domain === shopDomain).slice(0, limit);
-  }
-
+export async function listEbayLinks(shop, limit = 200) {
   const r = await pool.query(
     `
-    SELECT id, shop_domain, trigger, status, summary, started_at, finished_at
-    FROM runs
-    WHERE shop_domain = $1
-    ORDER BY started_at DESC
+    SELECT sku, shopify_product_id, shopify_variant_id, status, ebay_offer_id, ebay_listing_id, last_error, updated_at
+    FROM ebay_links
+    WHERE shop=$1
+    ORDER BY updated_at DESC
     LIMIT $2
-  `,
-    [shopDomain, limit]
+    `,
+    [shop, limit]
   );
-
   return r.rows;
 }
-
-async function getRunWithLogs(runId, limitLogs = 400) {
-  if (!hasDb()) {
-    const run = (memory.runs || []).find((r) => r.id === runId) || null;
-    const logs = (memory.runLogs.get(runId) || []).slice(-limitLogs);
-    return { run, logs };
-  }
-
-  const runR = await pool.query(
-    `
-    SELECT id, shop_domain, trigger, status, summary, started_at, finished_at
-    FROM runs
-    WHERE id = $1
-  `,
-    [runId]
-  );
-
-  const logsR = await pool.query(
-    `
-    SELECT run_id, level, message, meta, created_at
-    FROM run_logs
-    WHERE run_id = $1
-    ORDER BY created_at ASC
-    LIMIT $2
-  `,
-    [runId, limitLogs]
-  );
-
-  return { run: runR.rows[0] || null, logs: logsR.rows };
-}
-
-module.exports = {
-  initDb,
-  upsertShopToken,
-  getShopToken,
-  markProcessed,
-  isProcessed,
-  createRun,
-  addRunLog,
-  finishRun,
-  listRuns,
-  getRunWithLogs,
-};
